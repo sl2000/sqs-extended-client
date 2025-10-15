@@ -79,6 +79,8 @@ The SQS Extended Client supports the following options:
 * `messageSizeThreshold` - maximum size in bytes for message payloads before they are stored in S3 (default: `262144`)
 * `sendTransform` - see _Transforms_ section
 * `receiveTransform` - see _Transforms_ section
+* `compatibleMode` - If true, use messsage body and attributes compatible with SQS Extended Client for Java
+* `use_legacy_attribute` - Applies to compatible mode only - if True, all published messages use the Legacy reserved message attribute (SQSLargePayloadSize) instead of the current reserved message attribute (ExtendedPayloadSize).
 
 Note that the use of transforms overrides the `alwaysUseS3` and `messageSizeThreshold` options.
 
