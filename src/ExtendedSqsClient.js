@@ -16,6 +16,8 @@ const { isLarge } = require('./sqsMessageSizeUtils');
 const S3_MESSAGE_KEY_MARKER = '-..s3Key..-';
 const S3_BUCKET_NAME_MARKER = '-..s3BucketName..-';
 const S3_MESSAGE_BODY_KEY = 'S3MessageBodyKey';
+const COMPATIBLE_ATTRIBUTE_NAME = "ExtendedPayloadSize";
+const COMPATIBLE_ATTRIBUTE_NAME_LEGACY = "SQSLargePayloadSize";
 
 function defaultSendTransform(alwaysUseS3, messageSizeThreshold) {
     return (message) => {
@@ -32,28 +34,48 @@ function defaultReceiveTransform() {
     return (message, s3Content) => s3Content || message.body || message.Body;
 }
 
-function getS3MessageKeyAndBucket(message) {
+function getS3MessageKeyAndBucket(message, compatibleMode) {
     const messageAttributes = message.messageAttributes || message.MessageAttributes || {};
 
-    if (!messageAttributes[S3_MESSAGE_BODY_KEY]) {
+    if (messageAttributes[S3_MESSAGE_BODY_KEY]) {
+        const s3MessageKeyAttr = messageAttributes[S3_MESSAGE_BODY_KEY];
+        const s3MessageKey = s3MessageKeyAttr.stringValue || s3MessageKeyAttr.StringValue;
+
+        if (!s3MessageKey) {
+            throw new Error(`Invalid ${S3_MESSAGE_BODY_KEY} message attribute: Missing stringValue/StringValue`);
+        }
+
+        const s3MessageKeyRegexMatch = s3MessageKey.match(/^\((.*)\)(.+)/);
+
         return {
-            bucketName: null,
-            s3MessageKey: null,
+            bucketName: s3MessageKeyRegexMatch[1],
+            s3MessageKey: s3MessageKeyRegexMatch[2],
         };
     }
 
-    const s3MessageKeyAttr = messageAttributes[S3_MESSAGE_BODY_KEY];
-    const s3MessageKey = s3MessageKeyAttr.stringValue || s3MessageKeyAttr.StringValue;
-
-    if (!s3MessageKey) {
-        throw new Error(`Invalid ${S3_MESSAGE_BODY_KEY} message attribute: Missing stringValue/StringValue`);
+    if (compatibleMode && (
+        messageAttributes[COMPATIBLE_ATTRIBUTE_NAME]
+        || (messageAttributes[COMPATIBLE_ATTRIBUTE_NAME_LEGACY])
+    )) {
+        let body;
+        try {
+            body = JSON.parse(message.Body);
+        }
+        catch (err) {
+            throw new Error(`Invalid message body: Cannot parse JSON for useS3 message`);
+        }
+        if (!(body.s3BucketName && body.s3Key)) {
+            throw new Error(`Invalid message body: Mising s3BucketName and/or s3Key`);
+        }
+        return {
+            bucketName: body.s3BucketName,
+            s3MessageKey: body.s3Key
+        };
     }
 
-    const s3MessageKeyRegexMatch = s3MessageKey.match(/^\((.*)\)(.+)/);
-
     return {
-        bucketName: s3MessageKeyRegexMatch[1],
-        s3MessageKey: s3MessageKeyRegexMatch[2],
+        bucketName: null,
+        s3MessageKey: null,
     };
 }
 
@@ -89,7 +111,16 @@ function getOriginReceiptHandle(receiptHandle) {
         : receiptHandle;
 }
 
-function addS3MessageKeyAttribute(s3MessageKey, attributes) {
+function addS3MessageKeyAttribute(s3MessageKey, attributes, messageBody, compatibleMode, use_legacy_attribute) {
+    if (compatibleMode) {
+        return {
+            ...attributes,
+            [use_legacy_attribute ? COMPATIBLE_ATTRIBUTE_NAME_LEGACY : COMPATIBLE_ATTRIBUTE_NAME]: {
+                DataType: 'Number',
+                StringValue: messageBody.length.toString()
+            }
+        };
+    }
     return {
         ...attributes,
         [S3_MESSAGE_BODY_KEY]: {
@@ -110,6 +141,11 @@ class ExtendedSqsClient {
         this.sendTransform =
             options.sendTransform || defaultSendTransform(options.alwaysUseS3, options.messageSizeThreshold);
         this.receiveTransform = options.receiveTransform || defaultReceiveTransform();
+
+         // Compatible with Amazon SQS Extended Client Library for Java
+         this.compatibleMode = options.compatibleMode || false;
+         // If True, all published messages use the Legacy reserved message attribute (SQSLargePayloadSize) instead of the current reserved message attribute (ExtendedPayloadSize).
+         this.use_legacy_attribute = options.use_legacy_attribute || false;
     }
 
     _storeS3Content(key, s3Content) {
@@ -146,7 +182,7 @@ class ExtendedSqsClient {
             before: async ({ event }) => {
                 await Promise.all(
                     event.Records.map(async (record) => {
-                        const { bucketName, s3MessageKey } = getS3MessageKeyAndBucket(record);
+                        const { bucketName, s3MessageKey } = getS3MessageKeyAndBucket(record, this.compatibleMode);
 
                         if (s3MessageKey) {
                             /* eslint-disable-next-line no-param-reassign */
@@ -254,11 +290,23 @@ class ExtendedSqsClient {
             s3MessageKey = uuidv4();
             sendParams.MessageAttributes = addS3MessageKeyAttribute(
                 `(${this.bucketName})${s3MessageKey}`,
-                sendParams.MessageAttributes
+                sendParams.MessageAttributes,
+                sendParams.MessageBody,
+                this.compatibleMode,
+                this.use_legacy_attribute
             );
-            sendParams.MessageBody = sendObj.messageBody || s3MessageKey;
+            if (this.compatibleMode) {
+                sendParams.MessageBody = JSON.stringify({
+                    s3BucketName: this.bucketName,
+                    s3Key: s3MessageKey
+                });
+            } else if (sendObj.messageBody) {
+                sendParams.MessageBody = sendObj.messageBody;
+            } else {
+                sendParams.MessageBody = s3MessageKey;
+            }
         }
-
+        
         return {
             s3MessageKey,
             sendParams,
@@ -312,7 +360,7 @@ class ExtendedSqsClient {
         const messages = await Promise.all(
             (response.Messages || []).map(async (input) => {
                 const message = { ...input };
-                const { bucketName, s3MessageKey } = getS3MessageKeyAndBucket(message);
+                const { bucketName, s3MessageKey } = getS3MessageKeyAndBucket(message, this.compatibleMode);
                 if (s3MessageKey) {
                     message.Body = this.receiveTransform(message, await this._getS3Content(bucketName, s3MessageKey));
                     message.ReceiptHandle = embedS3MarkersInReceiptHandle(
@@ -334,6 +382,9 @@ class ExtendedSqsClient {
             ...params,
             MessageAttributeNames: [...(params.MessageAttributeNames || []), ExtendedSqsClient.RESERVED_ATTRIBUTE_NAME],
         };
+        if (this.compatibleMode) {
+            modifiedParams.MessageAttributeNames.push(COMPATIBLE_ATTRIBUTE_NAME, COMPATIBLE_ATTRIBUTE_NAME_LEGACY);
+        }
         const receiveMessageCommand = new ReceiveMessageCommand(modifiedParams);
         const response = await this.sqsClient.send(receiveMessageCommand);
         return this._processReceive(response);
